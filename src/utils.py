@@ -2,7 +2,6 @@ import os
 import logging
 from dotenv import load_dotenv
 from pathlib import Path
-import json
 from sqlalchemy import text
 # Load environment variables
 load_dotenv()
@@ -13,18 +12,6 @@ def get_env(var_name: str):
     if value is None:
         raise EnvironmentError(f"Missing required environment variable: {var_name}")
     return value
-
-# Logging setup
-def setup_logger(name="app", log_file="logs/app.log"):
-    os.makedirs("logs", exist_ok=True)
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-# -*- coding: utf-8 -*-
 
 def get_project_root():
     """
