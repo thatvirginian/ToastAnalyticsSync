@@ -580,6 +580,10 @@ def upsert_orders(conn, orders_list):
                     modified_date           = EXCLUDED.modified_date,
                     closed_date             = EXCLUDED.closed_date,
                     paid_date               = EXCLUDED.paid_date,
+                    fire_date               = EXCLUDED.fire_date,
+                    business_date           = EXCLUDED.business_date,
+                    dining_option_guid      = EXCLUDED.dining_option_guid,
+                    estimated_fulfillment_date = EXCLUDED.estimated_fulfillment_date,
                     last_modified_device_id = EXCLUDED.last_modified_device_id;
             """), tier1_heads)
 
