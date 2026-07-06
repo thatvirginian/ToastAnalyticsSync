@@ -689,7 +689,9 @@ def upsert_orders(conn, orders_list):
                     refund_amount       = EXCLUDED.refund_amount,
                     tip_refund_amount   = EXCLUDED.tip_refund_amount,
                     void_date           = EXCLUDED.void_date,
-                    void_reason_guid    = EXCLUDED.void_reason_guid;
+                    void_reason_guid    = EXCLUDED.void_reason_guid,
+                    void_user_guid      = EXCLUDED.void_user_guid,
+                    void_approver_guid  = EXCLUDED.void_approver_guid;
             """), tier2b_payments)
 
         # ── TIER 2c ──────────────────────────────────────────────────────────
