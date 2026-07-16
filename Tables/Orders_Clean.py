@@ -72,9 +72,113 @@ def _refund_fields(obj):
     }
 
 
+# ── Recursive selection walker ────────────────────────────────────────────────
+
+def _walk_selections(node, check_guid, order_guid, location_id,
+                     parent_guid=None, depth=0, accumulator=None):
+    """
+    Recursively walks a Toast selection node and all its nested modifiers,
+    appending one dict per node to accumulator for bulk insert into
+    order_selections.
+
+    Args:
+        node:        A selection or modifier dict from the Toast API JSON.
+        check_guid:  The parent check GUID (passed down unchanged).
+        order_guid:  The parent order GUID (passed down unchanged).
+        location_id: Injected by the pull function onto the order root.
+        parent_guid: selection_guid of the containing node. None at depth 0.
+        depth:       Current nesting level. 0 = top-level item, 1+ = modifiers.
+        accumulator: List to append extracted dicts to.
+    """
+    if accumulator is None:
+        accumulator = []
+
+    if not isinstance(node, dict) or not node.get('guid'):
+        return accumulator
+
+    s_guid    = node['guid']
+    item_ref  = node.get('item')        or {}
+    item_grp  = node.get('itemGroup')   or {}
+    opt_grp   = node.get('optionGroup') or {}
+    pre_mod   = node.get('preModifier') or {}
+    sales_cat = node.get('salesCategory') or {}
+    din_opt   = node.get('diningOption') or {}
+    split_org = node.get('splitOrigin') or {}
+    ref_flds  = _refund_fields(node)
+
+    accumulator.append({
+        "selection_guid":               s_guid,
+        "parent_guid":                  parent_guid,
+        "check_guid":                   check_guid,
+        "order_guid":                   order_guid,
+        "location_id":                  location_id,
+        "external_id":                  node.get('externalId'),
+        "depth":                        depth,
+
+        "item_guid":                    _guid(item_ref),
+        "item_multi_location_id":       item_ref.get('multiLocationId'),
+        "item_group_guid":              _guid(item_grp),
+        "item_group_multi_loc_id":      item_grp.get('multiLocationId'),
+        "option_group_guid":            _guid(opt_grp),
+        "option_group_multi_loc_id":    opt_grp.get('multiLocationId'),
+        "sales_category_guid":          _guid(sales_cat),
+        "pre_modifier_guid":            _guid(pre_mod),
+        "pre_modifier_multi_loc_id":    pre_mod.get('multiLocationId'),
+        "dining_option_guid":           _guid(din_opt),
+        "split_origin_guid":            _guid(split_org),
+
+        "display_name":                 node.get('displayName'),
+        "selection_type":               node.get('selectionType'),
+        "unit_of_measure":              node.get('unitOfMeasure'),
+        "plu":                          node.get('plu'),
+        "premodifier_plu":              node.get('premodifierPlu'),
+        "sales_category_plu":           node.get('salesCategoryPlu'),
+        "seat_number":                  node.get('seatNumber'),
+        "void_reason":                  _guid(node.get('voidReason')),
+
+        "quantity":                     node.get('quantity'),
+        "unit_price":                   node.get('receiptLinePrice'),
+        "net_price":                    node.get('price'),
+        "pre_discount_price":           node.get('preDiscountPrice'),
+        "open_price_amount":            node.get('openPriceAmount'),
+        "external_price_amount":        node.get('externalPriceAmount'),
+        "tax_amount":                   node.get('tax'),
+        "tax_inclusion":                node.get('taxInclusion'),
+        "option_group_pricing_mode":    node.get('optionGroupPricingMode'),
+
+        "refund_amount":                ref_flds["refund_amount"],
+        "tax_refund_amount":            ref_flds["tax_refund_amount"],
+        "refund_transaction_guid":      ref_flds["refund_transaction_guid"],
+
+        "fulfillment_status":           node.get('fulfillmentStatus'),
+        "voided":                       node.get('voided', False),
+        "deferred":                     node.get('deferred', False),
+
+        "created_date":                 node.get('createdDate'),
+        "modified_date":                node.get('modifiedDate'),
+        "void_date":                    node.get('voidDate'),
+        "void_business_date":           node.get('voidBusinessDate'),
+    })
+
+    # ── Recurse into nested modifiers ─────────────────────────────────────────
+    for child in [m for m in node.get('modifiers', []) if isinstance(m, dict) and m.get('guid')]:
+        _walk_selections(
+            child,
+            check_guid=check_guid,
+            order_guid=order_guid,
+            location_id=location_id,
+            parent_guid=s_guid,
+            depth=depth + 1,
+            accumulator=accumulator,
+        )
+
+    return accumulator
+
+
 # ── Main upsert ───────────────────────────────────────────────────────────────
 
-def upsert_orders(conn, orders_list):
+def upsert_orders(conn, orders_list, force=False, tiers=None):
+
     """
     Full-capture upsert aligned with the complete Toast API JSON schema.
     Orders whose modifiedDate is not newer than the stored modified_date
@@ -98,7 +202,11 @@ def upsert_orders(conn, orders_list):
         "orders_skipped":    0,
         "items_added":       0,
         "payments_added":    0,
+        "selections_added":  0,
     }
+
+    def _run(tier_name):
+        return tiers is None or tier_name in tiers
 
     if not orders_list:
         return stats
@@ -112,6 +220,8 @@ def upsert_orders(conn, orders_list):
     stored_dates = _fetch_stored_modified_dates(conn, set(incoming_guids.keys()))
 
     def is_stale(o_guid, incoming_modified):
+        if force:
+            return False
         stored = stored_dates.get(o_guid)
         if stored is None:
             return False
@@ -134,6 +244,7 @@ def upsert_orders(conn, orders_list):
     tier3b_taxes          = []
     tier3c_item_discounts = []
     tier4_mods            = []
+    tier5_selections      = []
 
     # ── Extraction & Transformation ───────────────────────────────────────────
     for order in orders_list:
@@ -459,6 +570,17 @@ def upsert_orders(conn, orders_list):
                 })
                 stats["items_added"] += 1
 
+                # ── TIER 5: Recursive selection tree ──────────────────────────
+                _walk_selections(
+                    sel,
+                    check_guid=c_guid,
+                    order_guid=o_guid,
+                    location_id=order.get('location_id'),
+                    parent_guid=None,
+                    depth=0,
+                    accumulator=tier5_selections,
+                )
+
                 # ── TIER 3b: Applied Taxes per Selection ──────────────────────
                 for tax in [t for t in sel.get('appliedTaxes', []) if isinstance(t, dict) and t.get('guid')]:
                     tax_rate_ref = tax.get('taxRate') or {}
@@ -545,7 +667,7 @@ def upsert_orders(conn, orders_list):
     # ── Batch Execution ───────────────────────────────────────────────────────
     try:
         # ── TIER 1 ───────────────────────────────────────────────────────────
-        if tier1_heads:
+        if _run("head") and tier1_heads:
             conn.execute(text("""
                 INSERT INTO orders_head (
                     order_guid, location_id, external_id, order_number,
@@ -588,7 +710,7 @@ def upsert_orders(conn, orders_list):
             """), tier1_heads)
 
         # ── TIER 1b ──────────────────────────────────────────────────────────
-        if tier1b_delivery:
+        if _run("delivery") and tier1b_delivery:
             conn.execute(text("""
                 INSERT INTO order_delivery_info (
                     order_guid, address1, address2, city, state, zip_code,
@@ -602,6 +724,12 @@ def upsert_orders(conn, orders_list):
                     :delivery_employee_guid
                 )
                 ON CONFLICT (order_guid) DO UPDATE SET
+                    address1                = EXCLUDED.address1,
+                    address2                = EXCLUDED.address2,
+                    city                    = EXCLUDED.city,
+                    state                   = EXCLUDED.state,
+                    zip_code                = EXCLUDED.zip_code,
+                    notes                   = EXCLUDED.notes,
                     delivery_state          = EXCLUDED.delivery_state,
                     dispatched_date         = EXCLUDED.dispatched_date,
                     delivered_date          = EXCLUDED.delivered_date,
@@ -609,7 +737,7 @@ def upsert_orders(conn, orders_list):
             """), tier1b_delivery)
 
         # ── TIER 2 ───────────────────────────────────────────────────────────
-        if tier2_checks:
+        if _run("checks") and tier2_checks:
             conn.execute(text("""
                 INSERT INTO order_checks (
                     check_guid, order_guid, external_id, display_number,
@@ -644,11 +772,15 @@ def upsert_orders(conn, orders_list):
                     closed_date     = EXCLUDED.closed_date,
                     paid_date       = EXCLUDED.paid_date,
                     voided          = EXCLUDED.voided,
-                    deleted         = EXCLUDED.deleted;
+                    void_date       = EXCLUDED.void_date,
+                    void_business_date  = EXCLUDED.void_business_date,
+                    modified_date    = EXCLUDED.modified_date,    
+                    deleted         = EXCLUDED.deleted,
+                    deleted_date    = EXCLUDED.deleted_date;
             """), tier2_checks)
 
         # ── TIER 2b ──────────────────────────────────────────────────────────
-        if tier2b_payments:
+        if _run("payments") and tier2b_payments:
             conn.execute(text("""
                 INSERT INTO check_payments (
                     payment_guid, check_guid, order_guid, external_id,
@@ -686,16 +818,20 @@ def upsert_orders(conn, orders_list):
                     refund_status       = EXCLUDED.refund_status,
                     amount              = EXCLUDED.amount,
                     tip_amount          = EXCLUDED.tip_amount,
+                    refund_date         = EXCLUDED.refund_date,
                     refund_amount       = EXCLUDED.refund_amount,
+                    refund_business_date  = EXCLUDED.refund_business_date,
                     tip_refund_amount   = EXCLUDED.tip_refund_amount,
                     void_date           = EXCLUDED.void_date,
                     void_reason_guid    = EXCLUDED.void_reason_guid,
                     void_user_guid      = EXCLUDED.void_user_guid,
-                    void_approver_guid  = EXCLUDED.void_approver_guid;
+                    void_approver_guid  = EXCLUDED.void_approver_guid,
+                    void_business_date  = EXCLUDED.void_business_date,
+                    last_modified_device_id  = EXCLUDED.last_modified_device_id;
             """), tier2b_payments)
 
         # ── TIER 2c ──────────────────────────────────────────────────────────
-        if tier2c_chk_discounts:
+        if _run("check_discounts") and tier2c_chk_discounts:
             conn.execute(text("""
                 INSERT INTO check_discounts (
                     discount_guid, check_guid, external_id,
@@ -710,11 +846,22 @@ def upsert_orders(conn, orders_list):
                     :discount_ref_guid, :processing_state,
                     :applied_promo_code, :approver_guid
                 )
-                ON CONFLICT (discount_guid) DO NOTHING;
+                ON CONFLICT (discount_guid) DO UPDATE SET
+                    discount_guid           = EXCLUDED.discount_guid, 
+                    check_guid              = EXCLUDED.check_guid, 
+                    discount_amount         = EXCLUDED.discount_amount, 
+                    non_tax_discount_amount = EXCLUDED.non_tax_discount_amount,
+                    discount_name           = EXCLUDED.discount_name, 
+                    discount_type           = EXCLUDED.discount_type, 
+                    discount_percent        = EXCLUDED.discount_percent,
+                    discount_ref_guid       = EXCLUDED.discount_ref_guid, 
+                    processing_state        = EXCLUDED.processing_state,
+                    applied_promo_code      = EXCLUDED.applied_promo_code, 
+                    approver_guid           = EXCLUDED.approver_guid;
             """), tier2c_chk_discounts)
 
         # ── TIER 2d ──────────────────────────────────────────────────────────
-        if tier2d_svc_charges:
+        if _run("service_charges") and tier2d_svc_charges:
             conn.execute(text("""
                 INSERT INTO check_service_charges (
                     charge_guid, check_guid, external_id,
@@ -737,7 +884,7 @@ def upsert_orders(conn, orders_list):
             """), tier2d_svc_charges)
 
         # ── TIER 2e ──────────────────────────────────────────────────────────
-        if tier2e_svc_taxes:
+        if _run("service_taxes") and tier2e_svc_taxes:
             conn.execute(text("""
                 INSERT INTO service_charge_taxes (
                     applied_tax_guid, charge_guid, tax_rate_guid,
@@ -754,7 +901,7 @@ def upsert_orders(conn, orders_list):
             """), tier2e_svc_taxes)
 
         # ── TIER 3 ───────────────────────────────────────────────────────────
-        if tier3_items:
+        if _run("items") and tier3_items:
             conn.execute(text("""
                 INSERT INTO order_items (
                     selection_guid, check_guid, external_id,
@@ -791,15 +938,21 @@ def upsert_orders(conn, orders_list):
                 )
                 ON CONFLICT (selection_guid) DO UPDATE SET
                     voided                  = EXCLUDED.voided,
+                    void_date               = EXCLUDED.void_date,
                     fulfillment_status      = EXCLUDED.fulfillment_status,
                     modified_date           = EXCLUDED.modified_date,
                     item_group_guid         = EXCLUDED.item_group_guid,
                     item_group_multi_loc_id = EXCLUDED.item_group_multi_loc_id,
-                    refund_amount           = EXCLUDED.refund_amount;
+                    refund_amount           = EXCLUDED.refund_amount,
+                    quantity                = EXCLUDED.quantity,
+                    unit_price              = EXCLUDED.unit_price,
+                    net_price               = EXCLUDED.net_price,
+                    pre_discount_price      = EXCLUDED.pre_discount_price,
+                    tax_amount              = EXCLUDED.tax_amount;
             """), tier3_items)
 
         # ── TIER 3b ──────────────────────────────────────────────────────────
-        if tier3b_taxes:
+        if _run("item_taxes") and tier3b_taxes:
             conn.execute(text("""
                 INSERT INTO item_applied_taxes (
                     applied_tax_guid, selection_guid, tax_rate_guid,
@@ -816,7 +969,7 @@ def upsert_orders(conn, orders_list):
             """), tier3b_taxes)
 
         # ── TIER 3c ──────────────────────────────────────────────────────────
-        if tier3c_item_discounts:
+        if _run("item_discounts") and tier3c_item_discounts:
             conn.execute(text("""
                 INSERT INTO item_discounts (
                     discount_guid, selection_guid, external_id,
@@ -831,11 +984,17 @@ def upsert_orders(conn, orders_list):
                     :discount_ref_guid, :processing_state,
                     :applied_promo_code, :approver_guid
                 )
-                ON CONFLICT (discount_guid) DO NOTHING;
+                ON CONFLICT (discount_guid) DO UPDATE SET
+                    discount_name = EXCLUDED.discount_name,
+                    discount_amount = EXCLUDED.discount_amount,
+                    discount_percent = EXCLUDED.discount_percent,
+                    processing_state = EXCLUDED.processing_state,
+                    applied_promo_code = EXCLUDED.applied_promo_code,
+                    approver_guid = EXCLUDED.approver_guid;
             """), tier3c_item_discounts)
 
         # ── TIER 4 ───────────────────────────────────────────────────────────
-        if tier4_mods:
+        if _run("modifiers") and tier4_mods:
             conn.execute(text("""
                 INSERT INTO item_modifiers (
                     modifier_guid, selection_guid, external_id,
@@ -869,10 +1028,72 @@ def upsert_orders(conn, orders_list):
                     :void_business_date, :void_reason
                 )
                 ON CONFLICT (modifier_guid) DO UPDATE SET
-                    voided          = EXCLUDED.voided,
-                    modified_date   = EXCLUDED.modified_date,
-                    refund_amount   = EXCLUDED.refund_amount;
+                    voided              = EXCLUDED.voided,
+                    void_date           = EXCLUDED.void_date,
+                    void_reason         = EXCLUDED.void_reason,
+                    modified_date       = EXCLUDED.modified_date,
+                    refund_amount       = EXCLUDED.refund_amount,
+                    quantity            = EXCLUDED.quantity,
+                    mod_unit_price      = EXCLUDED.mod_unit_price,
+                    mod_net_price       = EXCLUDED.mod_net_price,
+                    pre_discount_price  = EXCLUDED.pre_discount_price,
+                    tax_amount          = EXCLUDED.tax_amount;
             """), tier4_mods)
+
+        # ── TIER 5 ───────────────────────────────────────────────────────────
+        if _run("selections") and tier5_selections:
+            conn.execute(text("""
+                INSERT INTO order_selections (
+                    selection_guid, parent_guid, check_guid, order_guid,
+                    location_id, external_id, depth,
+                    item_guid, item_multi_location_id,
+                    item_group_guid, item_group_multi_loc_id,
+                    option_group_guid, option_group_multi_loc_id,
+                    sales_category_guid,
+                    pre_modifier_guid, pre_modifier_multi_loc_id,
+                    dining_option_guid, split_origin_guid,
+                    display_name, selection_type, unit_of_measure,
+                    plu, premodifier_plu, sales_category_plu,
+                    seat_number, void_reason,
+                    quantity, unit_price, net_price, pre_discount_price,
+                    open_price_amount, external_price_amount,
+                    tax_amount, tax_inclusion, option_group_pricing_mode,
+                    refund_amount, tax_refund_amount, refund_transaction_guid,
+                    fulfillment_status, voided, deferred,
+                    created_date, modified_date, void_date, void_business_date
+                ) VALUES (
+                    :selection_guid, :parent_guid, :check_guid, :order_guid,
+                    :location_id, :external_id, :depth,
+                    :item_guid, :item_multi_location_id,
+                    :item_group_guid, :item_group_multi_loc_id,
+                    :option_group_guid, :option_group_multi_loc_id,
+                    :sales_category_guid,
+                    :pre_modifier_guid, :pre_modifier_multi_loc_id,
+                    :dining_option_guid, :split_origin_guid,
+                    :display_name, :selection_type, :unit_of_measure,
+                    :plu, :premodifier_plu, :sales_category_plu,
+                    :seat_number, :void_reason,
+                    :quantity, :unit_price, :net_price, :pre_discount_price,
+                    :open_price_amount, :external_price_amount,
+                    :tax_amount, :tax_inclusion, :option_group_pricing_mode,
+                    :refund_amount, :tax_refund_amount, :refund_transaction_guid,
+                    :fulfillment_status, :voided, :deferred,
+                    :created_date, :modified_date, :void_date, :void_business_date
+                )
+                ON CONFLICT (selection_guid) DO UPDATE SET
+                    voided                    = EXCLUDED.voided,
+                    fulfillment_status        = EXCLUDED.fulfillment_status,
+                    modified_date             = EXCLUDED.modified_date,
+                    refund_amount             = EXCLUDED.refund_amount,
+                    quantity                  = EXCLUDED.quantity,
+                    unit_price                = EXCLUDED.unit_price,
+                    net_price                 = EXCLUDED.net_price,
+                    pre_discount_price        = EXCLUDED.pre_discount_price,
+                    tax_amount                = EXCLUDED.tax_amount,
+                    parent_guid               = EXCLUDED.parent_guid,
+                    depth                     = EXCLUDED.depth;
+            """), tier5_selections)
+            stats["selections_added"] += len(tier5_selections)
 
     except Exception as e:
         logger.error(f"Error during Orders_Clean batch insert: {e}")
