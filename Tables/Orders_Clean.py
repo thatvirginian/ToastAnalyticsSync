@@ -765,6 +765,7 @@ def upsert_orders(conn, orders_list, force=False, tiers=None):
                     :opened_by_guid, :created_device_id, :last_modified_device_id
                 )
                 ON CONFLICT (check_guid) DO UPDATE SET
+                    order_guid      = EXCLUDED.order_guid,
                     payment_status  = EXCLUDED.payment_status,
                     total_amount    = EXCLUDED.total_amount,
                     tax_amount      = EXCLUDED.tax_amount,
@@ -937,6 +938,7 @@ def upsert_orders(conn, orders_list, force=False, tiers=None):
                     :void_business_date, :void_reason
                 )
                 ON CONFLICT (selection_guid) DO UPDATE SET
+                    check_guid              = EXCLUDED.check_guid,
                     voided                  = EXCLUDED.voided,
                     void_date               = EXCLUDED.void_date,
                     fulfillment_status      = EXCLUDED.fulfillment_status,
@@ -1081,6 +1083,8 @@ def upsert_orders(conn, orders_list, force=False, tiers=None):
                     :created_date, :modified_date, :void_date, :void_business_date
                 )
                 ON CONFLICT (selection_guid) DO UPDATE SET
+                    order_guid                = EXCLUDED.order_guid,
+                    check_guid                = EXCLUDED.check_guid, 
                     voided                    = EXCLUDED.voided,
                     fulfillment_status        = EXCLUDED.fulfillment_status,
                     modified_date             = EXCLUDED.modified_date,
