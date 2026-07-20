@@ -44,7 +44,7 @@ def main():
 
     # ── Orders sync ───────────────────────────────────────────────────────────
     try:
-        run_order_update(target_date=target_date, engine=engine, API=api)
+        run_order_update(target_date=target_date, engine=engine, API=api,force=True)
     except Exception as e:
         logger.critical(f"Orders sync failed: {e}", exc_info=True)
         sys.exit(1)
